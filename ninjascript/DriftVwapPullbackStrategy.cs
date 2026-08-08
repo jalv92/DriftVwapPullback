@@ -190,7 +190,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     Log(Name + ": requires a 5-minute primary series; got "
                         + BarsPeriods[0].ToString(), Cbi.LogLevel.Error);
-                    SetState(State.Finalized);
+                    // Fix round 2: State.Terminated, not State.Finalized -- see
+                    // CheckRth's comment for the evidence. setstate.md is explicit
+                    // ("Setting State to State.Terminated is meant as a way to
+                    // abort the strategy as it is running") and its own example is
+                    // this exact SetState-then-return shape.
+                    SetState(State.Terminated);
+                    return;
                 }
             }
         }
@@ -207,7 +213,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
 
             int before = _reg15.Count;
-            FoldClosedRegimeBars();
+            // Fix round 2 (CRITICAL): FoldClosedRegimeBars() used to be void,
+            // so its own internal `return` on a failed regime-side CheckRth
+            // only exited that method -- this caller fell straight through
+            // into the draw loop, the flatten check, UpdateArmState and
+            // potentially a live EnterLong/EnterShort, on the very bar the
+            // strategy just declared fatal. The accumulator itself stayed
+            // clean (FoldRegimeBar never ran for the bad bar), but an order
+            // could still be submitted on top of a declared-unusable bar.
+            if (!FoldClosedRegimeBars())
+                return;
             for (int i = before; i < _reg15.Count; i++)
                 DrawRegimeBar(i);
 
@@ -321,7 +336,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         // the `> Time[0]` break is the ONLY thing standing between this loop
         // and lookahead. IT MUST NEVER BE WEAKENED. Same guard, same
         // reasoning, as PullbackZoneStrategy.FoldClosedZoneBars.
-        private void FoldClosedRegimeBars()
+        //
+        // Returns false when a regime bar fails CheckRth (the strategy has
+        // already requested termination) so the caller can abort THIS bar's
+        // OnBarUpdate instead of falling through to the draw loop, the
+        // flatten check and the trigger with a live order -- see the caller.
+        private bool FoldClosedRegimeBars()
         {
             Bars b15 = BarsArray[Regime15Idx];
             for (int j = _regDone + 1; j < b15.Count; j++)
@@ -329,10 +349,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (b15.GetTime(j) > Time[0])
                     break;                                 // not closed yet
                 if (!CheckRth(b15.GetTime(j), "regime (15m)"))
-                    return;                                // never fold an out-of-RTH bar
+                    return false;                          // never fold an out-of-RTH bar
                 FoldRegimeBar(b15, j);
                 _regDone = j;
             }
+            return true;
         }
 
         // Fix round 1 -- the NT8 counterpart of entries()'s RTH hard-fail
@@ -344,9 +365,22 @@ namespace NinjaTrader.NinjaScript.Strategies
         // holiday, a mislabeled template). This mirrors that exactly: every
         // bar this file ever reads from either series is checked at the
         // moment it is about to be used, and the strategy refuses to run
-        // (Log at Error + SetState(State.Finalized), same pattern as the
+        // (Log at Error + SetState(State.Terminated), same pattern as the
         // 5-minute timeframe guard in DataLoaded) rather than degrade into a
         // silently wrong VWAP -- never a warning that lets the bar through.
+        //
+        // Fix round 2: State.Terminated, not State.Finalized. Reflecting the
+        // real NinjaTrader.Core.dll this machine compiles against confirms
+        // Finalized(9) is a genuine enum member one past Terminated(8), but
+        // it appears nowhere in NinjaTrader's public developer docs (state.md,
+        // onstatechange.md, understanding_the_lifecycle_of.md all describe
+        // only Terminated as the shutdown/cleanup state). setstate.md is
+        // explicit and unambiguous: "Setting State to State.Terminated is
+        // meant as a way to abort the strategy as it is running," with a
+        // worked example matching this exact shape (SetState then return in
+        // OnBarUpdate). Finalized was carried over from the plan's own Task 5
+        // snippet into both this guard and the pre-existing timeframe guard;
+        // both now use Terminated.
         //
         // Bound is (RthOpenHHMMSS, RthCloseHHMMSS] -- open-EXCLUSIVE,
         // close-INCLUSIVE -- which is the mirror of, not identical to,
@@ -372,7 +406,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 + "(entries() raises ValueError on any bar outside RTH); "
                 + "apply this strategy to an RTH-only session template.",
                 Cbi.LogLevel.Error);
-            SetState(State.Finalized);
+            SetState(State.Terminated);
             return false;
         }
 
