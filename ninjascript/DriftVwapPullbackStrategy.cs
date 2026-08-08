@@ -137,6 +137,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private static readonly object _jsonlLock = new object();
         private string _jsonlPath;
+        private bool _jsonlDisabled;   // set true only if this run's truncate itself fails
 
         protected override void OnStateChange()
         {
@@ -183,6 +184,39 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _regDone = -1;
                 _lastRegimeIdx = null; _prevState = 0; _armed = false; _armedDir = 0;
                 _openTrade = null;
+
+                // Fix round 3: resolve the JSONL path ONCE here (WriteTrade no
+                // longer builds it) and truncate exactly once per run --
+                // DataLoaded "is called only once after all data series have
+                // been loaded" (onstatechange.md), and IsInstantiatedOnEach-
+                // OptimizationIteration defaults true, so every Playback
+                // re-enable / backtest / optimization iteration gets a fresh
+                // instance and its own single DataLoaded call, same guarantee
+                // the reset block above already relies on. Without this,
+                // every re-enable appended to the previous run's file --
+                // Javier's real Playback output had 15 entry_ts duplicated
+                // 2-4x, 24 extra rows in 32, because the mirror gate can't
+                // join on a duplicated key.
+                _jsonlPath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                    "DriftVwap", "nt8_trades.jsonl");
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(_jsonlPath));
+                    File.WriteAllText(_jsonlPath, string.Empty);   // truncate: one run, one file
+                    _jsonlDisabled = false;
+                }
+                catch (Exception ex)
+                {
+                    // Can't guarantee a clean file this run. Appending anyway
+                    // would risk mixing this run's rows into a stale file --
+                    // exactly the bug being fixed, just quieter. Disable the
+                    // dump for the whole run instead of guessing; the Log
+                    // entry says why so a missing/short file isn't a mystery.
+                    Log(Name + ": could not truncate " + _jsonlPath + " (" + ex.Message
+                        + ") -- JSONL trade dump disabled for this run.", Cbi.LogLevel.Error);
+                    _jsonlDisabled = true;
+                }
 
                 // Spec 5.2: the timeframe is a property of the RUN, not of the code.
                 if (BarsPeriods[0].BarsPeriodType != BarsPeriodType.Minute
@@ -582,9 +616,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         // formatted dates -- they exceed 2^53 so a float-parsing consumer
         // would silently round them (task 8 step 2). Path/lock/try-catch
         // pattern copied from PullbackZoneStrategy's corpus writer: logging
-        // must never break trading.
+        // must never break trading. Path is resolved once, at DataLoaded --
+        // not here -- so there is exactly one place that builds it (fix
+        // round 3); _jsonlDisabled is set there too, if that run's own
+        // truncate failed.
         private void WriteTrade(OpenTrade t, long exitTicks, double exitPx, string reason)
         {
+            if (_jsonlDisabled)
+                return;
+
             StringBuilder sb = new StringBuilder(160);
             sb.Append("{\"entry_ts\":").Append(t.EntryTicks.ToString(CultureInfo.InvariantCulture))
               .Append(",\"exit_ts\":").Append(exitTicks.ToString(CultureInfo.InvariantCulture))
@@ -596,13 +636,8 @@ namespace NinjaTrader.NinjaScript.Strategies
               .Append("}");
             try
             {
-                if (_jsonlPath == null)
-                    _jsonlPath = Path.Combine(
-                        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-                        "DriftVwap", "nt8_trades.jsonl");
                 lock (_jsonlLock)
                 {
-                    Directory.CreateDirectory(Path.GetDirectoryName(_jsonlPath));
                     File.AppendAllText(_jsonlPath, sb.ToString() + Environment.NewLine);
                 }
             }
