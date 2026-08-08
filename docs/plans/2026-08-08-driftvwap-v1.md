@@ -714,7 +714,7 @@ protected override void OnStateChange()
         {
             Log("DriftVwapPullback requires a 5-minute primary series; got "
                 + BarsPeriods[0].ToString(), LogLevel.Error);
-            SetState(State.Finalized);
+            SetState(State.Terminated);   // Terminated is the documented abort state; Finalized is not in NT8's State enum table
         }
     }
 }
