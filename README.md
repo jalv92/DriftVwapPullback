@@ -24,8 +24,6 @@
   <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="">
 </p>
 
-<img src="docs/assets/hero.png" width="100%" alt="The strategy drawn on an NQ 5-minute chart: the 15-minute session VWAP, the drift-state crosses, and the trigger bars">
-
 </div>
 
 ---
@@ -78,8 +76,6 @@ Exits are a fixed 80-point stop against a 40-point target long, 50 short, plus a
 The premise is that VWAP is not a mean-reversion magnet but a place where institutional
 execution imbalance becomes visible — so the trade is continuation, not reversion.
 
-<img src="docs/assets/mirror.png" width="100%" alt="The fidelity gate: NinjaTrader and PropSim trade lists compared side by side, entry bar, direction and exit price">
-
 ## Status and limits
 
 **Nothing is built and nothing is validated.** This repository currently contains one thing:
@@ -96,8 +92,6 @@ What is already known before the first line is written:
   The four before it were negative.
 
 None of that is a verdict. It is the reason the study is worth running rather than assumed.
-
-<img src="docs/assets/streaks.png" width="100%" alt="Distribution of consecutive losing trades, which sets the daily loss cap from measurement instead of inheriting the source's number">
 
 ## Read next
 
