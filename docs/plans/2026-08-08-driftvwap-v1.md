@@ -180,7 +180,7 @@ BUCKETS_PER_DAY_15 = 96                  # 86400 / 900
 
 def _selfcheck_regime():
     # Two sessions of synthetic 5-minute bars, 78 per session (09:30..16:00).
-    bars = _fake_bars(sessions=2, drift_pts_per_bar=1.0)
+    bars = _fake_bars(sessions=2, drift_pts_per_bar=4.0)
     r = _regime(bars)
     assert len(r["key"]) == 2 * 26, f"26 fifteen-minute bars per session, got {len(r['key'])}"
     # A monotonically rising session: once five bars exist, the state is LONG.
@@ -190,7 +190,7 @@ def _selfcheck_regime():
 
 
 def _selfcheck_vwap_resets_per_session():
-    bars = _fake_bars(sessions=2, drift_pts_per_bar=1.0)
+    bars = _fake_bars(sessions=2, drift_pts_per_bar=4.0)
     r = _regime(bars)
     starts = np.flatnonzero(r["n_in_session"] == 0)
     assert len(starts) == 2, "two session starts"
@@ -205,7 +205,7 @@ def _selfcheck_lookback_never_crosses_sessions():
     # walked into the previous session, the first bars of session 2 would read
     # LONG off yesterday's closes. The RTH tape is contiguous across days, so
     # this is the trap the spec calls out in R2.
-    bars = _fake_bars(sessions=2, drift_pts_per_bar=1.0, flip_second=True)
+    bars = _fake_bars(sessions=2, drift_pts_per_bar=4.0, flip_second=True)
     r = _regime(bars)
     s2 = np.flatnonzero(r["n_in_session"] == 0)[1]
     assert (r["state"][s2:s2 + 4] == 0).all(), (
@@ -222,8 +222,28 @@ Expected: FAIL with `NameError: name '_fake_bars' is not defined`.
 - [ ] **Step 3: Implement `_fake_bars`, `_bucket15` and `_regime`**
 
 ```python
-def _fake_bars(sessions=1, drift_pts_per_bar=0.0, flip_second=False, day0=20000):
-    """Synthetic 5-minute RTH bars: 78 per session, 09:30..15:55 inclusive."""
+def _fake_bars(sessions=1, drift_pts_per_bar=0.0, flip_second=False, day0=20000,
+               pullback_every=0, flat_window=None):
+    """Synthetic 5-minute RTH bars: 78 per session, 09:30..15:55 inclusive.
+
+    `pullback_every=N` makes every Nth bar a counter-direction candle without
+    reversing the trend (N=5 nets +3 points per 5 bars), which is what gives
+    the long trigger something to fire on.
+
+    `flat_window=(lo_s, hi_s)` holds price flat across that seconds-of-day
+    span, which zeroes the one-hour rate of change and drives the drift state
+    to FLAT — the break a re-arm test needs.
+
+    THE DRIFT MAGNITUDE IS LOAD-BEARING, not decoration. R2 needs more than
+    0.10% over one hour, and one hour is twelve 5-minute bars. At 20000, that
+    is more than 20 points per hour, so more than ~1.67 points per bar — and
+    `pullback_every=5` cuts the net rate by a further 40%. The checks use 4.0,
+    which nets ~2.4 points per bar with pullbacks on (~0.14% per hour) and 4.0
+    with them off (~0.24%). At 1.0 the fixture yields 0.06% per hour, every
+    state reads FLAT, and every state assertion fails — or worse, an assertion
+    written as "at most one entry" passes on zero entries and tests nothing.
+    If you change this number, redo the arithmetic.
+    """
     t, o, h, l, c, v, start = [], [], [], [], [], [], []
     px = 20000.0
     tick_i = 0
@@ -232,7 +252,13 @@ def _fake_bars(sessions=1, drift_pts_per_bar=0.0, flip_second=False, day0=20000)
         for k in range(78):
             sod = RTH_START_S + k * 300
             ts = (day0 + d) * 86400 * tp.TPS + sod * tp.TPS
-            nxt = px + step
+            if flat_window is not None and flat_window[0] <= sod < flat_window[1]:
+                delta = 0.0
+            elif pullback_every and (k % pullback_every) == pullback_every - 1:
+                delta = -step
+            else:
+                delta = step
+            nxt = px + delta
             t.append(ts); o.append(px); c.append(nxt)
             h.append(max(px, nxt) + 1.0); l.append(min(px, nxt) - 1.0)
             v.append(100.0); start.append(tick_i)
@@ -366,7 +392,7 @@ def _selfcheck_state_applies_at_coincident_close():
     # last 15m bar closing AT OR BEFORE T, so that bar counts. This is the
     # single rule the NinjaScript side must match and the one most likely to
     # drift, so it is pinned here in the mirror's own vocabulary.
-    bars = _fake_bars(sessions=1, drift_pts_per_bar=1.0)
+    bars = _fake_bars(sessions=1, drift_pts_per_bar=4.0)
     key_done = _last_completed_key(bars)
     # 5m bar index 15 opens 10:45 and closes 10:50 -> group closing 10:45.
     # 5m bar index 14 opens 10:40, closes 10:45 -> the 10:45 group counts.
@@ -376,16 +402,38 @@ def _selfcheck_state_applies_at_coincident_close():
 
 
 def _selfcheck_arming_requires_a_transition():
-    # An uninterrupted drift produces exactly ONE trade (R3). If arming
-    # re-armed on every bar this would produce dozens.
-    bars = _fake_bars(sessions=1, drift_pts_per_bar=1.0)
+    # An uninterrupted drift produces exactly ONE trade (R3): the arm is
+    # consumed by the FIRST counter-direction candle and never re-arms,
+    # because re-arming needs the 15m state to leave LONG and come back.
+    #
+    # `pullback_every` is load-bearing. Without it a monotonically rising
+    # session has no red candle at all, the long trigger can never fire, and
+    # an assertion of "at most one entry" would pass on zero entries -- true
+    # for the wrong reason, and blind to an arming bug that fires on every
+    # red candle. The session must CONTAIN pullbacks for this to test arming.
+    bars = _fake_bars(sessions=1, drift_pts_per_bar=4.0, pullback_every=5)
     s = DriftVwapPullback()
     idx, direc, stop, target = s.entries(bars, _fake_tape(bars), _defaults())
-    assert len(idx) <= 1, f"an unbroken drift must arm once, got {len(idx)} entries"
+    assert len(idx) == 1, (
+        f"an unbroken drift must produce exactly one entry, got {len(idx)}; "
+        f"more than one means arming re-fires without a state transition")
+    assert direc[0] == 1, "a rising session must go long"
+
+
+def _selfcheck_arming_rearms_after_a_break():
+    # The mirror of the check above: when the state DOES leave LONG and come
+    # back, a second trade is allowed. Together the two pin R3 from both
+    # sides -- one alone is satisfiable by a strategy that never re-arms.
+    bars = _fake_bars(sessions=1, drift_pts_per_bar=4.0, pullback_every=5,
+                      flat_window=(11 * 3600, 12 * 3600))
+    s = DriftVwapPullback()
+    idx, _, _, _ = s.entries(bars, _fake_tape(bars), _defaults())
+    assert len(idx) == 2, (
+        f"a drift that breaks and returns must arm twice, got {len(idx)}")
 
 
 def _selfcheck_stop_and_target_sides():
-    bars = _fake_bars(sessions=1, drift_pts_per_bar=1.0)
+    bars = _fake_bars(sessions=1, drift_pts_per_bar=4.0)
     s = DriftVwapPullback()
     idx, direc, stop, target = s.entries(bars, tp_ = _fake_tape(bars), p=_defaults())
     for i in range(len(idx)):
@@ -401,7 +449,7 @@ def _selfcheck_stop_and_target_sides():
 
 
 def _selfcheck_time_window():
-    bars = _fake_bars(sessions=1, drift_pts_per_bar=1.0)
+    bars = _fake_bars(sessions=1, drift_pts_per_bar=4.0)
     s = DriftVwapPullback()
     idx, direc, _, _ = s.entries(bars, _fake_tape(bars), _defaults())
     for i in idx:
