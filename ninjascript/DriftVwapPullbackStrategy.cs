@@ -6,12 +6,12 @@
 // implementation. Every rule below is transcribed from that file and where the
 // two disagree THAT FILE WINS.
 //
-// LAB STATUS -- SKELETON + REGIME ONLY (plan tasks 5+6). This file has the
-// closed parameter list, the 5-minute timeframe guard, and the 15-minute
-// session VWAP + drift state (R1/R2). It has NO entries, NO exits, NO orders
-// and NO drawing -- that is task 7. OnBarUpdate's primary-series branch
-// currently only prints the drift state for manual verification against the
-// plugin.
+// LAB STATUS -- FULL v1 (plan tasks 5-8). Parameter list, 5-minute timeframe
+// guard, 15-minute session VWAP + drift state (R1/R2), the R3/R4 arm+trigger
+// state machine, R5's 15:55 flatten, bracket orders, chart drawing and the
+// JSONL trade dump for the mirror gate are all here. UpdateArmState() carries
+// a line-by-line correspondence comment against the plugin's entries() loop
+// -- read it before touching the state machine.
 //
 // R4 -- THE COINCIDENT-CLOSE TRAP, AND WHY THIS FILE DOES NOT DEPEND ON
 // SERIES PROCESSING ORDER AT ALL. At 10:45, 11:00, ... a 5-minute bar and a
@@ -62,9 +62,17 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using System.Windows.Media;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.Gui.Tools;
 using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
 #endregion
 
 namespace NinjaTrader.NinjaScript.Strategies
@@ -72,6 +80,12 @@ namespace NinjaTrader.NinjaScript.Strategies
     public class DriftVwapPullbackStrategy : Strategy
     {
         private const int Regime15Idx = 1;
+        private const int PTS = 4;              // NQ ticks per index point -- plugin's own PTS
+        private const int DriftDotOffsetTicks = 40;   // cosmetic only, not a shared param
+
+        private const string SigLong = "DVP_L";
+        private const string SigShort = "DVP_S";
+        private const string SigFlatten = "DVP_Flatten";
 
         // One closed 15m bar: its own close timestamp, close price, session
         // VWAP as of that close, and its 0-based position within the current
@@ -91,12 +105,38 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int _barsInSession15;
         private int _regDone = -1;      // last BarsArray[Regime15Idx] index folded into _reg15
 
+        // R3/R4 arm/trigger state -- mirrors entries()'s prev_state/armed/
+        // armed_dir/last_key exactly; see UpdateArmState(). Nullable so the
+        // very first bar (idx possibly -1, "no 15m bar closed yet") still
+        // compares unequal and forces one evaluation, the same way Python's
+        // `last_key = None` does.
+        private int? _lastRegimeIdx;
+        private int _prevState;
+        private bool _armed;
+        private int _armedDir;
+
+        // One open trade's entry side, captured at the entry fill and
+        // consumed at the exit fill that leaves the strategy flat. See
+        // OnExecutionUpdate for why this doesn't yet handle a same-day
+        // reversal cleanly (task-78 report).
+        private struct OpenTrade
+        {
+            public long EntryTicks;
+            public double EntryPx;
+            public int Dir;
+            public int Qty;
+        }
+        private OpenTrade? _openTrade;
+
+        private static readonly object _jsonlLock = new object();
+        private string _jsonlPath;
+
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
             {
                 Name = "DriftVwapPullbackStrategy";
-                Description = "Mirror of propsim/drift_vwap_pullback.py -- 15m VWAP drift + 5m pullback trigger (Conti). SKELETON: no regime/entries yet (plan tasks 6-7). See docs/specs/2026-08-07-driftvwap-design.md.";
+                Description = "Mirror of propsim/drift_vwap_pullback.py -- 15m VWAP drift + 5m pullback trigger (Conti). See docs/specs/2026-08-07-driftvwap-design.md.";
                 Calculate = Calculate.OnBarClose;
                 EntriesPerDirection = 1;
                 EntryHandling = EntryHandling.AllEntries;
@@ -118,6 +158,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Contracts = 1;
                 MaxTradesPerDay = 0;
                 MaxLossesPerDay = 0;
+
+                ShowDrawings = true;   // C#-only, not a shared param -- see its Display attribute
             }
             else if (State == State.Configure)
             {
@@ -132,6 +174,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _reg15.Clear();
                 _cumPv = 0; _cumV = 0; _barsInSession15 = 0;
                 _regDone = -1;
+                _lastRegimeIdx = null; _prevState = 0; _armed = false; _armedDir = 0;
+                _openTrade = null;
 
                 // Spec 5.2: the timeframe is a property of the RUN, not of the code.
                 if (BarsPeriods[0].BarsPeriodType != BarsPeriodType.Minute
@@ -152,16 +196,109 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (BarsInProgress != 0 || CurrentBar < 0)
                 return;
 
+            int before = _reg15.Count;
             FoldClosedRegimeBars();
+            for (int i = before; i < _reg15.Count; i++)
+                DrawRegimeBar(i);
 
-            // Diagnostic only (task 6, GUI hand-off step 3): prints the drift
-            // state and session VWAP at every 5m close so it can be compared,
-            // bar for bar, against the plugin's state_of[done[i]] on the same
-            // session. Task 7 replaces this with the R3 arming state machine
-            // and the R4 trigger -- this line prints, it does not act.
-            Print(Name + ": " + Time[0].ToString("yyyy-MM-dd HH:mm")
-                + " drift=" + DriftStateAt(Time[0])
-                + " vwap15=" + SessionVwap15(0).ToString("F2"));
+            // R5 -- flatten takes priority over everything below it. A
+            // position must never survive past FlattenHHMM regardless of
+            // what the arm/trigger state machine would otherwise do on this
+            // same bar, so this returns rather than falling through to it.
+            // The plugin has no flatten concept to mirror here (spec 5.3 /
+            // task-7 brief step 3) -- this half is NT8-only.
+            if (Position.MarketPosition != MarketPosition.Flat && ToTime(Time[0]) >= FlattenHHMM * 100)
+            {
+                if (Position.MarketPosition == MarketPosition.Long)
+                    ExitLong(SigFlatten, SigLong);
+                else
+                    ExitShort(SigFlatten, SigShort);
+                return;
+            }
+
+            UpdateArmState();
+
+            if (!_armed)
+                return;
+
+            // R4 -- the trade window, on the bar's own CLOSE (Time[0] IS the
+            // close under NT8's bar stamping -- see the file header), exactly
+            // like the plugin's sod_close[i] = sod[i] + 300.
+            int sodClose = ToTime(Time[0]);
+            if (sodClose < TradeStartHHMM * 100 || sodClose > TradeStopHHMM * 100)
+                return;
+
+            bool fired = (_armedDir > 0 && Close[0] < Open[0]) || (_armedDir < 0 && Close[0] > Open[0]);
+            if (!fired)
+                return;
+
+            // Bracket BEFORE the entry, same pass -- called after, the
+            // bracket attaches to the NEXT trade and this one runs naked
+            // (the TBStrategy bug already on record in this workspace).
+            SetStopLoss(CalculationMode.Ticks, StopPoints * PTS);
+            SetProfitTarget(CalculationMode.Ticks,
+                (_armedDir > 0 ? TargetPointsLong : TargetPointsShort) * PTS);
+            if (_armedDir > 0)
+                EnterLong(Contracts, SigLong);
+            else
+                EnterShort(Contracts, SigShort);
+
+            if (ShowDrawings && ChartControl != null)
+            {
+                if (_armedDir > 0)
+                    Draw.ArrowUp(this, "DVP_Trig_" + CurrentBar, false, 0, Low[0] - 4 * TickSize, Brushes.Lime);
+                else
+                    Draw.ArrowDown(this, "DVP_Trig_" + CurrentBar, false, 0, High[0] + 4 * TickSize, Brushes.Red);
+            }
+
+            _armed = false;   // the arm is consumed by this firing -- see UpdateArmState
+        }
+
+        // R3/R4's state machine -- a line-by-line port of the plugin's
+        // entries() loop body:
+        //
+        //   k = int(done[i])                        -> idx = LastCompletedIndex(Time[0])
+        //   if k != last_key:                        -> if (idx != _lastRegimeIdx)
+        //       st = int(state_of.get(k, 0))          ->     st = DriftStateAt(Time[0])
+        //       if st != prev_state:                  ->     if (st != _prevState)
+        //           armed = st != 0                    ->         _armed = st != 0
+        //           armed_dir = st                      ->         _armedDir = st
+        //       prev_state = st                        ->     _prevState = st
+        //       last_key = k                            ->     _lastRegimeIdx = idx
+        //
+        // `last_key = None` in Python always compares unequal on the first
+        // bar, forcing one evaluation even while idx == -1 ("no 15m bar
+        // closed yet"); `_lastRegimeIdx` being nullable reproduces exactly
+        // that, rather than colliding with -1 as a legitimate sentinel.
+        //
+        // What the plugin's loop ALSO has that this method deliberately does
+        // NOT reproduce: `if day[i + 1] != day[i]: continue` (never carry a
+        // signal into a fill on the next calendar day). That guard exists
+        // because Python resolves the entry's fill by indexing the literal
+        // NEXT bar in an array, which can be tomorrow's bar if today's array
+        // has run out; NT8 instead submits a live market order that fills on
+        // whatever the next tick turns out to be, so there is no equivalent
+        // "index into tomorrow" failure mode to guard against, and building
+        // one would need to look ahead into a bar that has not formed yet --
+        // the same lookahead this file's header goes out of its way to
+        // avoid elsewhere. Under the default TradeStopHHMM (1530), the next
+        // 5m bar is always well inside the same RTH session regardless, so
+        // this is believed to be a no-op difference; flagged here rather
+        // than silently assumed away, per the task-78 report.
+        private void UpdateArmState()
+        {
+            int idx = LastCompletedIndex(Time[0]);
+            if (_lastRegimeIdx == null || idx != _lastRegimeIdx.Value)
+            {
+                int st = DriftStateAt(Time[0]);
+                if (st != _prevState)
+                {
+                    _armed = st != 0;
+                    _armedDir = st;
+                }
+                _prevState = st;
+                _lastRegimeIdx = idx;
+            }
         }
 
         // Folds every 15m bar that has closed at or before the current 5m
@@ -265,6 +402,122 @@ namespace NinjaTrader.NinjaScript.Strategies
             return 0;
         }
 
+        // Task 7 step 4 -- chart furniture only, nothing here feeds the
+        // state machine. Called once per newly-folded 15m bar (see the
+        // `before`/`_reg15.Count` loop in OnBarUpdate), never per 5m bar, so
+        // each VWAP segment and drift dot is drawn exactly once under a
+        // unique index-based tag and never revisited.
+        private void DrawRegimeBar(int i)
+        {
+            if (!ShowDrawings || ChartControl == null)
+                return;
+
+            Reg15 cur = _reg15[i];
+            if (i > 0)
+            {
+                Reg15 prev = _reg15[i - 1];
+                Draw.Line(this, "DVP_Vwap_" + i, false, prev.CloseTime, prev.Vwap,
+                    cur.CloseTime, cur.Vwap, Brushes.DodgerBlue, DashStyleHelper.Solid, 2);
+            }
+
+            // DriftStateAt(cur.CloseTime) resolves back to index i itself --
+            // cur IS the last 15m bar closed at or before its own close --
+            // so this reuses the shared R2 formula instead of recomputing it.
+            int st = DriftStateAt(cur.CloseTime);
+            double off = DriftDotOffsetTicks * TickSize;
+            if (st > 0)
+                Draw.Dot(this, "DVP_Drift_" + i, false, cur.CloseTime, cur.Close + off, Brushes.Lime);
+            else if (st < 0)
+                Draw.Dot(this, "DVP_Drift_" + i, false, cur.CloseTime, cur.Close - off, Brushes.Red);
+        }
+
+        // Task 8 -- one JSONL trade row per closed position, for the mirror
+        // gate. Two passes: the entry fill seeds _openTrade; the exit fill
+        // that leaves the strategy flat consumes it and writes the row.
+        //
+        // KNOWN GAP, not silently assumed away: if a same-day opposite-
+        // direction re-arm fires (UpdateArmState can arm a fresh direction
+        // the instant the 15m state flips straight from +1 to -1 with no
+        // intervening FLAT bar) WHILE the previous trade's bracket has not
+        // yet resolved, NT8's managed order handling nets the reversal and
+        // the exact Order.Name NT8 assigns to the implicit close of the old
+        // leg is not something this file can verify without running
+        // NinjaTrader. `_openTrade == null` gates the entry branch so a
+        // reversal cannot clobber the still-open trade's fields, and the
+        // "manual" fallback below catches whatever the closing leg's order
+        // is named instead of mis-labeling it stop/target/flatten. See the
+        // task-78 report's hand-off checklist for how to check this on a
+        // real Playback run.
+        protected override void OnExecutionUpdate(Execution execution, string executionId,
+            double price, int quantity, MarketPosition marketPosition, string orderId, DateTime time)
+        {
+            if (execution == null || execution.Order == null)
+                return;
+            string n = execution.Order.Name;
+
+            if ((n == SigLong || n == SigShort) && _openTrade == null)
+            {
+                _openTrade = new OpenTrade
+                {
+                    EntryTicks = time.Ticks,
+                    EntryPx = price,
+                    Dir = n == SigLong ? 1 : -1,
+                    Qty = execution.Order.Quantity
+                };
+                return;
+            }
+
+            if (_openTrade != null && Position.MarketPosition == MarketPosition.Flat)
+            {
+                // SetStopLoss/SetProfitTarget's own default signal names --
+                // see their reference docs ("Stop loss" / "Profit target").
+                // Not a guess: this is what the two-arg overloads the brief
+                // specifies actually generate.
+                string reason = n == "Stop loss" ? "stop"
+                              : n == "Profit target" ? "target"
+                              : n == SigFlatten ? "flatten"
+                              : "manual";
+                WriteTrade(_openTrade.Value, time.Ticks, price, reason);
+                _openTrade = null;
+            }
+        }
+
+        private static string Px(double v)
+        {
+            return v.ToString("0.######", CultureInfo.InvariantCulture);
+        }
+
+        // entry_ts/exit_ts are raw .NET ticks as JSON INTEGERS, not
+        // formatted dates -- they exceed 2^53 so a float-parsing consumer
+        // would silently round them (task 8 step 2). Path/lock/try-catch
+        // pattern copied from PullbackZoneStrategy's corpus writer: logging
+        // must never break trading.
+        private void WriteTrade(OpenTrade t, long exitTicks, double exitPx, string reason)
+        {
+            StringBuilder sb = new StringBuilder(160);
+            sb.Append("{\"entry_ts\":").Append(t.EntryTicks.ToString(CultureInfo.InvariantCulture))
+              .Append(",\"exit_ts\":").Append(exitTicks.ToString(CultureInfo.InvariantCulture))
+              .Append(",\"dir\":").Append(t.Dir.ToString(CultureInfo.InvariantCulture))
+              .Append(",\"entry_px\":").Append(Px(t.EntryPx))
+              .Append(",\"exit_px\":").Append(Px(exitPx))
+              .Append(",\"reason\":\"").Append(reason).Append("\"")
+              .Append(",\"qty\":").Append(t.Qty.ToString(CultureInfo.InvariantCulture))
+              .Append("}");
+            try
+            {
+                if (_jsonlPath == null)
+                    _jsonlPath = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                        "DriftVwap", "nt8_trades.jsonl");
+                lock (_jsonlLock)
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(_jsonlPath));
+                    File.AppendAllText(_jsonlPath, sb.ToString() + Environment.NewLine);
+                }
+            }
+            catch { }
+        }
+
         #region Properties
         [NinjaScriptProperty, Range(1, 24)]
         [Display(Name = "Drift lookback (15m bars)", Description = "15m bars in the rate-of-change window. Frozen spec value: 4 (one hour).", GroupName = "01. Regime", Order = 0)]
@@ -309,6 +562,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty, Range(0, 20)]
         [Display(Name = "Max losses/day", Description = "0 = off. Applied as a post-hoc filter, not simulated live (spec 5.3).", GroupName = "04. Sizing", Order = 2)]
         public int MaxLossesPerDay { get; set; }
+
+        // The one C#-only parameter (task 7 brief item 5) -- chart furniture
+        // has nothing to simulate on the PropSim side, following
+        // LatigoBreak's ShowDrawings. Deliberately NOT mirrored in
+        // propsim/drift_vwap_pullback.py.
+        [NinjaScriptProperty]
+        [Display(Name = "Show drawings", GroupName = "05. Visuals", Order = 0)]
+        public bool ShowDrawings { get; set; }
         #endregion
     }
 }
