@@ -154,6 +154,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             public double EntryPx;
             public int Dir;
             public int Qty;
+            public double EntryCommission;   // fix round 9 -- net-of-commission loss test
         }
         private OpenTrade? _openTrade;
 
@@ -703,7 +704,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     EntryTicks = time.Ticks,
                     EntryPx = price,
                     Dir = n == SigLong ? 1 : -1,
-                    Qty = execution.Order.Quantity
+                    Qty = execution.Order.Quantity,
+                    EntryCommission = execution.Commission   // fix round 9
                 };
                 return;
             }
@@ -719,24 +721,37 @@ namespace NinjaTrader.NinjaScript.Strategies
                               : n == SigFlatten ? "flatten"
                               : "manual";
 
-                // Fix round 7 -- a "loss" is gross (pre-commission) directional
-                // price P&L, strict: (exitPx - entryPx) * dir < 0; a tie is NOT
-                // counted, same strictness convention DriftStateAt already uses
-                // ("comparisons are strict; a tie is FLAT"). Pre-commission
-                // because commission isn't naturally available at this call
-                // site (Execution/Order expose price and quantity, not a
-                // realized-P&L-with-commission figure) without reaching for
-                // SystemPerformance.AllTrades after the fact, and because it
-                // essentially never disagrees with net P&L here: the stop is
-                // 80 points (320 ticks) and the targets 40-50 points, both
-                // enormous next to any plausible per-side commission on NQ, so
-                // gross and net classification differ only in a razor-thin
-                // near-breakeven band this strategy's fixed stop/target
-                // geometry almost never lands in. Matches the team lead's own
-                // safety argument for why the caps are exact filters at all:
-                // the trigger is price-driven, not P&L-driven -- classifying
-                // by price alone stays inside that same spirit.
-                if ((price - _openTrade.Value.EntryPx) * _openTrade.Value.Dir < 0)
+                // Fix round 9 -- a "loss" is NET of commission, strict: gross
+                // price P&L converted to dollars, minus BOTH legs' commission,
+                // compared to zero; a tie is NOT a loss, same strictness
+                // convention DriftStateAt already uses ("comparisons are
+                // strict; a tie is FLAT"). Superseded the fix-round-7 gross
+                // (pre-commission) test after the risk audit found the gap
+                // that reasoning missed: the 80pt stop / 40-50pt targets make
+                // gross vs net essentially never disagree on THOSE three
+                // exits, but the 15:55 flatten is bounded by none of that
+                // geometry and can close within a tick or two of entry --
+                // exactly where commission decides win vs. small net loss.
+                // Misclassifying a marginal net loss as not-a-loss makes
+                // MaxLossesPerDay fire LATER than it should -- fails open in
+                // the one direction that costs money -- so net is the
+                // correct test, not gross with a documented blind spot.
+                //
+                // PointValue null-checked (this call site is OnExecutionUpdate,
+                // not OnBarUpdate -- pointvalue.md's own "no null check needed"
+                // exemption is scoped to OnBarUpdate only) and falls back to
+                // 0.0 as a ponytail: if MasterInstrument were ever
+                // unavailable here (should not happen -- an execution only
+                // fires for an instrument this strategy is actively trading),
+                // grossPnl collapses to 0 and netPnl is always <= -commission,
+                // i.e. every trade misclassifies as a loss -- the same fail-
+                // open-toward-caution direction as the reasoning above, not a
+                // silent hole in the other direction.
+                double pointValue = Instrument?.MasterInstrument?.PointValue ?? 0.0;
+                double grossPnl = (price - _openTrade.Value.EntryPx) * _openTrade.Value.Dir
+                    * pointValue * _openTrade.Value.Qty;
+                double netPnl = grossPnl - _openTrade.Value.EntryCommission - execution.Commission;
+                if (netPnl < 0)
                     _lossesToday++;
 
                 WriteTrade(_openTrade.Value, time.Ticks, price, reason);
@@ -819,11 +834,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int Contracts { get; set; }
 
         [NinjaScriptProperty, Range(0, 20)]
-        [Display(Name = "Max trades/day", Description = "0 = off. Applied as a post-hoc filter, not simulated live (spec 5.3).", GroupName = "04. Sizing", Order = 1)]
+        [Display(Name = "Max trades/day", Description = "0 = off. Blocks new entries once this many have been taken in the current RTH session; resets every session.", GroupName = "04. Sizing", Order = 1)]
         public int MaxTradesPerDay { get; set; }
 
         [NinjaScriptProperty, Range(0, 20)]
-        [Display(Name = "Max losses/day", Description = "0 = off. Applied as a post-hoc filter, not simulated live (spec 5.3).", GroupName = "04. Sizing", Order = 2)]
+        [Display(Name = "Max losses/day", Description = "0 = off. Blocks new entries once this many losing trades (net of commission) have closed in the current RTH session, total not consecutive; resets every session.", GroupName = "04. Sizing", Order = 2)]
         public int MaxLossesPerDay { get; set; }
 
         // The one C#-only parameter (task 7 brief item 5) -- chart furniture
