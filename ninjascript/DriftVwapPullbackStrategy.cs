@@ -148,7 +148,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private static readonly object _jsonlLock = new object();
         private string _jsonlPath;
-        private bool _jsonlDisabled;   // set true only if this run's truncate itself fails
+        private bool _jsonlDisabled;   // set true only if this run's own file creation fails
 
         protected override void OnStateChange()
         {
@@ -222,49 +222,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.DataLoaded)
             {
                 // A reused instance (e.g. IsInstantiatedOnEachOptimizationIteration
-                // == false on some future config) would otherwise carry the
-                // PREVIOUS run's accumulated 15m history into this one -- field
-                // initializers run once at construction, not per State chain.
-                _reg15.Clear();
-                _cumPv = 0; _cumV = 0; _barsInSession15 = 0;
-                _regDone = -1;
-                _lastRegimeIdx = null; _prevState = 0; _armed = false; _armedDir = 0;
-                _openTrade = null;
-
-                // Fix round 3: resolve the JSONL path ONCE here (WriteTrade no
-                // longer builds it) and truncate exactly once per run --
-                // DataLoaded "is called only once after all data series have
-                // been loaded" (onstatechange.md), and IsInstantiatedOnEach-
-                // OptimizationIteration defaults true, so every Playback
-                // re-enable / backtest / optimization iteration gets a fresh
-                // instance and its own single DataLoaded call, same guarantee
-                // the reset block above already relies on. Without this,
-                // every re-enable appended to the previous run's file --
-                // Javier's real Playback output had 15 entry_ts duplicated
-                // 2-4x, 24 extra rows in 32, because the mirror gate can't
-                // join on a duplicated key.
-                _jsonlPath = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-                    "DriftVwap", "nt8_trades.jsonl");
-                try
-                {
-                    Directory.CreateDirectory(Path.GetDirectoryName(_jsonlPath));
-                    File.WriteAllText(_jsonlPath, string.Empty);   // truncate: one run, one file
-                    _jsonlDisabled = false;
-                }
-                catch (Exception ex)
-                {
-                    // Can't guarantee a clean file this run. Appending anyway
-                    // would risk mixing this run's rows into a stale file --
-                    // exactly the bug being fixed, just quieter. Disable the
-                    // dump for the whole run instead of guessing; the Log
-                    // entry says why so a missing/short file isn't a mystery.
-                    Log(Name + ": could not truncate " + _jsonlPath + " (" + ex.Message
-                        + ") -- JSONL trade dump disabled for this run.", Cbi.LogLevel.Error);
-                    _jsonlDisabled = true;
-                }
-
-                // Spec 5.2: the timeframe is a property of the RUN, not of the code.
+                // Fix round 6: the timeframe guard runs FIRST, before anything
+                // else in this branch -- including the JSONL path/file setup
+                // below. A wrong-timeframe chart must never touch the JSONL
+                // file for a run that is about to abort; before this reorder
+                // the file setup ran first, so attaching to e.g. a 1-minute
+                // chart with a good file already on disk truncated it and
+                // THEN aborted, destroying a real run's output for a run that
+                // never started. Spec 5.2: the timeframe is a property of the
+                // RUN, not of the code.
                 if (BarsPeriods[0].BarsPeriodType != BarsPeriodType.Minute
                     || BarsPeriods[0].Value != 5)
                 {
@@ -277,6 +243,53 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // this exact SetState-then-return shape.
                     SetState(State.Terminated);
                     return;
+                }
+
+                // A reused instance (e.g. IsInstantiatedOnEachOptimizationIteration
+                // == false on some future config) would otherwise carry the
+                // PREVIOUS run's accumulated 15m history into this one -- field
+                // initializers run once at construction, not per State chain.
+                _reg15.Clear();
+                _cumPv = 0; _cumV = 0; _barsInSession15 = 0;
+                _regDone = -1;
+                _lastRegimeIdx = null; _prevState = 0; _armed = false; _armedDir = 0;
+                _openTrade = null;
+
+                // Fix round 3: resolve the JSONL path ONCE here (WriteTrade no
+                // longer builds it). Fix round 6: the path is now PER-RUN,
+                // not fixed -- two instances sharing one path (Javier runs the
+                // Strategy Analyzer mirror gate while keeping a Playback chart
+                // loaded for other checks, on the team lead's own recommended
+                // workflow) used to mean whichever instance's DataLoaded ran
+                // second truncated out whatever the other had already written
+                // THIS run, which a fixed path could never avoid short of
+                // detecting the collision. A per-run filename makes the
+                // collision impossible instead: nothing to truncate, nothing
+                // for a sibling instance to step on. Instrument + a
+                // to-the-second timestamp, not a hash -- readable at a glance
+                // in the folder, and DataLoaded firing exactly once per run
+                // (onstatechange.md: "called only once after all data series
+                // have been loaded") means this timestamp is read exactly
+                // once too, so it names this run and only this run.
+                string sym = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                _jsonlPath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                    "DriftVwap",
+                    "nt8_trades_" + sym + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".jsonl");
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(_jsonlPath));
+                    File.WriteAllText(_jsonlPath, string.Empty);   // create: fresh path, nothing to truncate
+                    _jsonlDisabled = false;
+                }
+                catch (Exception ex)
+                {
+                    // Can't guarantee this run gets a usable file. Disable the
+                    // dump for the whole run instead of guessing; the Log
+                    // entry says why so a missing file isn't a mystery.
+                    Log(Name + ": could not create " + _jsonlPath + " (" + ex.Message
+                        + ") -- JSONL trade dump disabled for this run.", Cbi.LogLevel.Error);
+                    _jsonlDisabled = true;
                 }
             }
         }
@@ -663,9 +676,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         // would silently round them (task 8 step 2). Path/lock/try-catch
         // pattern copied from PullbackZoneStrategy's corpus writer: logging
         // must never break trading. Path is resolved once, at DataLoaded --
-        // not here -- so there is exactly one place that builds it (fix
-        // round 3); _jsonlDisabled is set there too, if that run's own
-        // truncate failed.
+        // not here -- so there is exactly one place that builds it, and it's
+        // per-run unique (fix rounds 3 and 6); _jsonlDisabled is set there
+        // too, if that run's own file creation failed.
         private void WriteTrade(OpenTrade t, long exitTicks, double exitPx, string reason)
         {
             if (_jsonlDisabled)
