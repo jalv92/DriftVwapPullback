@@ -161,6 +161,17 @@ future. Both sides must derive the state from completed 15-minute bars only, and
 | No entries after | 15:30:00 ET |
 | Flatten all | 15:55:00 ET |
 
+**The flatten needs an engine change, and §5.3's claim to the contrary is
+wrong.** `entries()` returns an entry, a stop and a target and never sees the
+exit path, so a wall-clock exit cannot live in the plugin. PropSim's engine
+today closes an unresolved trade only at the 16:00 RTH session end — five
+minutes late, at a different price than NinjaTrader's, which would fail the
+mirror gate on every trade still open after 15:55. `resolve()` therefore gains a
+`flatten_hhmm` bound with a neutral default of 0, the same pattern by which
+`contracts`, `day_target` and `be_offset_ticks` entered without any other
+strategy noticing. §5.3 remains correct about the *loss cap*, which genuinely
+needs nothing.
+
 ### R6 — Exits
 
 | | Long | Short |
