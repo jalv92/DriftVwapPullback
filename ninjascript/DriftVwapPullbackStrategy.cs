@@ -282,7 +282,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Log(Name + ": daily caps ACTIVE this run (MaxTradesPerDay="
                         + MaxTradesPerDay + ", MaxLossesPerDay=" + MaxLossesPerDay
                         + ") -- NOT directly comparable to a default PropSim dump "
-                        + "unless the same filter is applied there.", Cbi.LogLevel.Alert);
+                        + "unless the same filter is applied there.", Cbi.LogLevel.Warning);
 
                 // Fix round 3: resolve the JSONL path ONCE here (WriteTrade no
                 // longer builds it). Fix round 6: the path is now PER-RUN,
