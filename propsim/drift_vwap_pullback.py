@@ -312,9 +312,16 @@ def _selfcheck_arming_rearms_after_a_break():
 
 
 def _selfcheck_stop_and_target_sides():
-    bars = _fake_bars(sessions=1, drift_pts_per_bar=4.0)
+    # pullback_every is load-bearing here too (see the comment on
+    # _selfcheck_arming_requires_a_transition): without it the session is
+    # monotonic green, the trigger never fires, idx comes back empty, and the
+    # loop below would pass on zero iterations -- caught in review, not by
+    # this file's own suite. The non-empty assert is the backstop even if a
+    # future edit to _fake_bars' defaults quietly re-introduces the gap.
+    bars = _fake_bars(sessions=1, drift_pts_per_bar=4.0, pullback_every=5)
     s = DriftVwapPullback()
     idx, direc, stop, target = s.entries(bars, _fake_tape(bars), _defaults())
+    assert len(idx) > 0, "fixture produced no entries; this check would pass vacuously"
     for i in range(len(idx)):
         fill = _fake_tape(bars)["px"][idx[i]]
         if direc[i] > 0:
@@ -327,10 +334,31 @@ def _selfcheck_stop_and_target_sides():
             assert abs(fill - target[i] - 50.0) < 1e-9
 
 
+def _selfcheck_short_side():
+    # None of the other seven fixtures ever drive armed_dir == -1 (all use a
+    # positive drift_pts_per_bar), so a sign error isolated to the short leg
+    # of entries() -- stop = fill + stop_points, target = fill -
+    # target_points_short -- would pass every other check in this file.
+    # Mirrors _selfcheck_arming_requires_a_transition with the sign flipped.
+    bars = _fake_bars(sessions=1, drift_pts_per_bar=-4.0, pullback_every=5)
+    s = DriftVwapPullback()
+    idx, direc, stop, target = s.entries(bars, _fake_tape(bars), _defaults())
+    assert len(idx) > 0, "falling fixture produced no entries; this check would pass vacuously"
+    assert (direc == -1).all(), "a falling session must go short"
+    fill = _fake_tape(bars)["px"][idx]
+    assert np.allclose(stop, fill + 80.0), "short stop must be entry + stop_points"
+    assert np.allclose(target, fill - 50.0), "short target must be entry - target_points_short"
+    for i in idx:
+        sod = tp.sec_of_day(bars["t"][i])
+        assert 10 * 3600 + 30 * 60 <= sod <= 15 * 3600 + 30 * 60, (
+            f"entry at {sod}s is outside the R5 window")
+
+
 def _selfcheck_time_window():
-    bars = _fake_bars(sessions=1, drift_pts_per_bar=4.0)
+    bars = _fake_bars(sessions=1, drift_pts_per_bar=4.0, pullback_every=5)
     s = DriftVwapPullback()
     idx, direc, _, _ = s.entries(bars, _fake_tape(bars), _defaults())
+    assert len(idx) > 0, "fixture produced no entries; this check would pass vacuously"
     for i in idx:
         sod = tp.sec_of_day(bars["t"][i])
         assert 10 * 3600 + 30 * 60 <= sod <= 15 * 3600 + 30 * 60, (
@@ -454,7 +482,8 @@ if __name__ == "__main__":
     _selfcheck_arming_requires_a_transition()
     _selfcheck_arming_rearms_after_a_break()
     _selfcheck_stop_and_target_sides()
+    _selfcheck_short_side()
     _selfcheck_time_window()
     print("selfcheck OK: regime, VWAP session reset, session-confined lookback, "
           "coincident close, arming transition, arming re-arm, stop/target sides, "
-          "time window")
+          "short side, time window")
