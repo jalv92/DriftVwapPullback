@@ -83,6 +83,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         private const int PTS = 4;              // NQ ticks per index point -- plugin's own PTS
         private const int DriftDotOffsetTicks = 40;   // cosmetic only, not a shared param
 
+        // Fix round 1: propsim/drift_vwap_pullback.py's entries() hard-fails
+        // (raises ValueError) on any bar outside RTH [09:30:00, 16:00:00) --
+        // see CheckRth for why this file's bound is written the other way
+        // (open-exclusive, close-inclusive) despite checking the same clock.
+        private const int RthOpenHHMMSS = 93000;    // 09:30:00
+        private const int RthCloseHHMMSS = 160000;  // 16:00:00
+
         private const string SigLong = "DVP_L";
         private const string SigShort = "DVP_S";
         private const string SigFlatten = "DVP_Flatten";
@@ -194,6 +201,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             // 15m regime is folded from THIS (primary) branch instead; see
             // the file header and FoldClosedRegimeBars.
             if (BarsInProgress != 0 || CurrentBar < 0)
+                return;
+
+            if (!CheckRth(Time[0], "primary (5m)"))
                 return;
 
             int before = _reg15.Count;
@@ -318,9 +328,52 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (b15.GetTime(j) > Time[0])
                     break;                                 // not closed yet
+                if (!CheckRth(b15.GetTime(j), "regime (15m)"))
+                    return;                                // never fold an out-of-RTH bar
                 FoldRegimeBar(b15, j);
                 _regDone = j;
             }
+        }
+
+        // Fix round 1 -- the NT8 counterpart of entries()'s RTH hard-fail
+        // (file header, propsim/drift_vwap_pullback.py: "raise ValueError ...
+        // requires an RTH-only tape"). The plugin's check is PER-BAR, over
+        // the bars["t"] array actually being processed, not a session-
+        // template inspection done once up front -- a declared template is a
+        // proxy for what the data contains, not a guarantee of it (a partial
+        // holiday, a mislabeled template). This mirrors that exactly: every
+        // bar this file ever reads from either series is checked at the
+        // moment it is about to be used, and the strategy refuses to run
+        // (Log at Error + SetState(State.Finalized), same pattern as the
+        // 5-minute timeframe guard in DataLoaded) rather than degrade into a
+        // silently wrong VWAP -- never a warning that lets the bar through.
+        //
+        // Bound is (RthOpenHHMMSS, RthCloseHHMMSS] -- open-EXCLUSIVE,
+        // close-INCLUSIVE -- which is the mirror of, not identical to,
+        // Python's [RTH_START_S, RTH_END_S) over bar OPENS. NT8 stamps a bar
+        // at its CLOSE (file header, R4 section), so the last legitimate RTH
+        // bar of every session -- 15:55-16:00 on the primary, 15:45-16:00 on
+        // the regime series -- closes at EXACTLY 16:00:00. A close-exclusive
+        // bound copied verbatim from Python's open-exclusive-at-the-other-end
+        // check would reject that bar as "outside RTH" and false-fail on
+        // ordinary, correct data. The two checks agree on every instant a
+        // bar could actually occupy; only the boundary arithmetic differs to
+        // account for which edge of the bar each side's timestamp names.
+        private bool CheckRth(DateTime t, string series)
+        {
+            int hhmmss = ToTime(t);
+            if (hhmmss > RthOpenHHMMSS && hhmmss <= RthCloseHHMMSS)
+                return true;
+
+            Log(Name + ": " + series + " bar closed at "
+                + t.ToString("yyyy-MM-dd HH:mm:ss")
+                + ", outside RTH (09:30:00, 16:00:00] -- refusing to run. "
+                + "propsim/drift_vwap_pullback.py hard-fails on this too "
+                + "(entries() raises ValueError on any bar outside RTH); "
+                + "apply this strategy to an RTH-only session template.",
+                Cbi.LogLevel.Error);
+            SetState(State.Finalized);
+            return false;
         }
 
         // R1 -- session VWAP over 15-minute bars, bar-typical formulation,
