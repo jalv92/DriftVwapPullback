@@ -402,9 +402,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             Log(Name + ": " + series + " bar closed at "
                 + t.ToString("yyyy-MM-dd HH:mm:ss")
                 + ", outside RTH (09:30:00, 16:00:00] -- refusing to run. "
-                + "propsim/drift_vwap_pullback.py hard-fails on this too "
-                + "(entries() raises ValueError on any bar outside RTH); "
-                + "apply this strategy to an RTH-only session template.",
+                + "FIX: set the chart's Trading Hours template to 'US Equities RTH' "
+                + "(09:30-16:00 Eastern). NOT 'CME US Index Futures RTH' -- that one "
+                + "is declared in CENTRAL time and runs 08:30-16:00 CT = 09:30-17:00 ET, "
+                + "so it emits bars past 16:00 ET and trips this same guard. "
+                + "propsim/drift_vwap_pullback.py hard-fails on out-of-RTH bars too "
+                + "(entries() raises ValueError), because the session VWAP anchors to "
+                + "the RTH open and a template that spans the overnight makes it wrong.",
                 Cbi.LogLevel.Error);
             SetState(State.Terminated);
             return false;
