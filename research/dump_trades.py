@@ -59,10 +59,22 @@ def _nt8_entry_ts(raw_net_ticks: int, bar_ticks: int) -> int:
     return boundary + bar_ticks
 
 
-def dump(contract, start=None, end=None, tf_secs=300, params=None):
-    """Run drift_vwap_pullback over PropSim's tape; return NT8-schema dicts."""
-    trades, meta = engine.backtest(contract, dvp.DriftVwapPullback.name,
-                                    tf_secs, start=start, end=end, params=params)
+def dump(contract, start=None, end=None, tf_secs=300, params=None, slippage_ticks=None):
+    """Run drift_vwap_pullback over PropSim's tape; return NT8-schema dicts.
+
+    `slippage_ticks=None` (the default) keeps PropSim's own pessimistic fill
+    model (engine.Costs' default, 2 ticks each way) -- this is what the
+    measurement run must use, and it stays the default so nobody gets an
+    accidentally-optimistic number from this function. Pass 0.0 ONLY for the
+    mirror-fidelity comparison against NinjaTrader, which fills at the real
+    price: that gate checks whether the two sides make the same DECISIONS,
+    and slippage is a cost model, not a decision, so it has to come out to
+    compare like for like. The caller states the value explicitly either way
+    -- it is never picked for them.
+    """
+    costs = None if slippage_ticks is None else engine.Costs(slippage_ticks=slippage_ticks)
+    trades, meta = engine.backtest(contract, dvp.DriftVwapPullback.name, tf_secs,
+                                    start=start, end=end, params=params, costs=costs)
     bar_ticks = tf_secs * TPS
     qty = int(meta["params"]["contracts"])
     rows = []
@@ -88,13 +100,17 @@ def main():
     ap.add_argument("--start")
     ap.add_argument("--end")
     ap.add_argument("--tf-secs", type=int, default=300)
+    ap.add_argument("--slippage-ticks", type=float, default=None,
+                     help="default: PropSim's own pessimistic 2.0 (engine.Costs). "
+                          "Pass 0 for the mirror-fidelity comparison against NT8.")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    rows = dump(a.contract, a.start, a.end, a.tf_secs)
+    rows = dump(a.contract, a.start, a.end, a.tf_secs, slippage_ticks=a.slippage_ticks)
     with open(a.out, "w") as f:
         for r in rows:
             f.write(json.dumps(r, separators=(",", ":")) + "\n")
-    print(f"wrote {len(rows)} trades to {a.out}")
+    effective = a.slippage_ticks if a.slippage_ticks is not None else engine.Costs.slippage_ticks
+    print(f"wrote {len(rows)} trades to {a.out} (slippage_ticks={effective})")
 
 
 if __name__ == "__main__":
