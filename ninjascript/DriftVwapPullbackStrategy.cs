@@ -80,6 +80,17 @@ namespace NinjaTrader.NinjaScript.Strategies
     public class DriftVwapPullbackStrategy : Strategy
     {
         private const int Regime15Idx = 1;
+
+        // Fix round 5: NOT OrderFillResolution.High -- see the SetDefaults
+        // comment for why. This series exists ONLY for NT8's own internal
+        // fill-resolution engine; nothing in this file ever reads
+        // BarsArray[FillTickIdx] or branches on BarsInProgress == FillTickIdx
+        // by name (the existing `if (BarsInProgress != 0 ...) return;` at the
+        // top of OnBarUpdate already no-ops it, same as it already does for
+        // Regime15Idx). Declared mainly so a future edit that adds a THIRD
+        // series has an explicit, named reason not to reuse index 2.
+        private const int FillTickIdx = 2;
+
         private const int PTS = 4;              // NQ ticks per index point -- plugin's own PTS
         private const int DriftDotOffsetTicks = 40;   // cosmetic only, not a shared param
 
@@ -168,10 +179,45 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MaxLossesPerDay = 0;
 
                 ShowDrawings = true;   // C#-only, not a shared param -- see its Display attribute
+
+                // Fix round 5 -- historical fill granularity, matching the
+                // PropSim engine's real-tick walk instead of NT8's default
+                // (Standard: fills resolved against the PRIMARY 5-minute bar,
+                // which can silently hide a stop AND a target inside the same
+                // bar and let the two sides disagree on which hit first).
+                //
+                // NOT OrderFillResolution.High: this strategy is multi-series
+                // (AddDataSeries(Minute, 15) below), and this workspace has a
+                // real, previously-hit NT8 runtime error on record for that
+                // exact combination -- HFT_NT8/decisions/ADR-004b: loading a
+                // multi-series strategy with OrderFillResolution.High throws
+                // "'High' Order Fill Resolution is only available for
+                // single-series strategies. For multi-series strategies,
+                // please program directly into your strategy the more
+                // granular resolution you would like to simulate order fills
+                // with." ADR-004b's own resolution is exactly what's below:
+                // Standard (already the default; written explicitly for the
+                // same reason ADR-004b does) + OrderFillResolutionType/Value
+                // pointed at a 1-tick series the strategy adds itself via
+                // AddDataSeries -- NT8 uses that series for fill refinement
+                // whether High or a manually-added series supplies it; the
+                // granularity is identical either way (ADR-004b section 3).
+                OrderFillResolution = OrderFillResolution.Standard;
+                OrderFillResolutionType = BarsPeriodType.Tick;
+                OrderFillResolutionValue = 1;
             }
             else if (State == State.Configure)
             {
-                AddDataSeries(BarsPeriodType.Minute, 15);   // BarsInProgress == 1
+                AddDataSeries(BarsPeriodType.Minute, 15);   // BarsInProgress == Regime15Idx (1)
+
+                // Fix round 5: the 1-tick fill-resolution series, ADDED AFTER
+                // the 15-minute one above so it becomes index FillTickIdx (2)
+                // and Regime15Idx (1) is UNCHANGED -- index order follows
+                // AddDataSeries call order, so reordering these two lines
+                // would silently repoint every BarsArray[Regime15Idx] read in
+                // this file at the wrong series. Never read directly; exists
+                // only for OrderFillResolutionType/Value above to consume.
+                AddDataSeries(BarsPeriodType.Tick, 1);      // BarsInProgress == FillTickIdx (2)
             }
             else if (State == State.DataLoaded)
             {
