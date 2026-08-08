@@ -133,6 +133,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool _armed;
         private int _armedDir;
 
+        // Fix round 7 -- MaxTradesPerDay/MaxLossesPerDay were UI decoration
+        // until now (Javier set both, the strategy ignored both). Reset each
+        // RTH session on Bars.IsFirstBarOfSession -- the same session-
+        // boundary primitive FoldRegimeBar already uses
+        // (IsFirstBarOfSessionByIndex) for the 15m series; no second notion
+        // of "day". Counted unconditionally (see OnBarUpdate/OnExecutionUpdate);
+        // only the CAP CHECK is gated on > 0, so a 0 default can never block
+        // anything regardless of what these hold.
+        private int _tradesToday;
+        private int _lossesToday;
+
         // One open trade's entry side, captured at the entry fill and
         // consumed at the exit fill that leaves the strategy flat. See
         // OnExecutionUpdate for why this doesn't yet handle a same-day
@@ -221,7 +232,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.DataLoaded)
             {
-                // A reused instance (e.g. IsInstantiatedOnEachOptimizationIteration
                 // Fix round 6: the timeframe guard runs FIRST, before anything
                 // else in this branch -- including the JSONL path/file setup
                 // below. A wrong-timeframe chart must never touch the JSONL
@@ -254,6 +264,25 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _regDone = -1;
                 _lastRegimeIdx = null; _prevState = 0; _armed = false; _armedDir = 0;
                 _openTrade = null;
+                _tradesToday = 0; _lossesToday = 0;   // fix round 7 -- also self-resets on the
+                                                       // first bar of every session (OnBarUpdate);
+                                                       // zeroed here too for a fresh run, same as
+                                                       // every other per-run field above.
+
+                // Fix round 7 -- loud, once, here (never per bar): a capped
+                // run's trade list is a SUBSET of what the plugin would
+                // produce (entries() never caps), so it is not directly
+                // comparable to a default PropSim dump unless the same
+                // filter is applied there too. LogLevel.Alert (log.md: "also
+                // generates a pop-up notification window") because Warning
+                // sitting in a scrollable Log tab is exactly the kind of
+                // message that gets missed -- this one has to land once, not
+                // be findable if you go looking.
+                if (MaxTradesPerDay > 0 || MaxLossesPerDay > 0)
+                    Log(Name + ": daily caps ACTIVE this run (MaxTradesPerDay="
+                        + MaxTradesPerDay + ", MaxLossesPerDay=" + MaxLossesPerDay
+                        + ") -- NOT directly comparable to a default PropSim dump "
+                        + "unless the same filter is applied there.", Cbi.LogLevel.Alert);
 
                 // Fix round 3: resolve the JSONL path ONCE here (WriteTrade no
                 // longer builds it). Fix round 6: the path is now PER-RUN,
@@ -334,9 +363,33 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
+            // Fix round 7 -- per-session reset, BEFORE the arm-gated early
+            // return below, so a session that never arms still clears the
+            // PREVIOUS session's counts (an early return here would leave a
+            // stale non-zero count sitting in front of a session that hasn't
+            // taken a single trade yet). Bars.IsFirstBarOfSession is the
+            // same session-boundary primitive FoldRegimeBar already uses on
+            // the 15m series -- no second notion of "day".
+            if (Bars.IsFirstBarOfSession)
+            {
+                _tradesToday = 0;
+                _lossesToday = 0;
+            }
+
             UpdateArmState();
 
             if (!_armed)
+                return;
+
+            // Fix round 7 -- Javier's own report: neither cap did anything
+            // before this. 0 means off (both defaults, unchanged): the
+            // condition is structurally false whenever the parameter is 0,
+            // regardless of what the counters hold, so the default path
+            // cannot be capped by construction, not by a value happening to
+            // stay below a threshold.
+            if (MaxTradesPerDay > 0 && _tradesToday >= MaxTradesPerDay)
+                return;
+            if (MaxLossesPerDay > 0 && _lossesToday >= MaxLossesPerDay)
                 return;
 
             // R4 -- the trade window, on the bar's own CLOSE (Time[0] IS the
@@ -360,6 +413,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 EnterLong(Contracts, SigLong);
             else
                 EnterShort(Contracts, SigShort);
+            _tradesToday++;   // fix round 7 -- counts the entry taken, not the eventual fill
 
             if (ShowDrawings && ChartControl != null)
             {
@@ -661,6 +715,27 @@ namespace NinjaTrader.NinjaScript.Strategies
                               : n == "Profit target" ? "target"
                               : n == SigFlatten ? "flatten"
                               : "manual";
+
+                // Fix round 7 -- a "loss" is gross (pre-commission) directional
+                // price P&L, strict: (exitPx - entryPx) * dir < 0; a tie is NOT
+                // counted, same strictness convention DriftStateAt already uses
+                // ("comparisons are strict; a tie is FLAT"). Pre-commission
+                // because commission isn't naturally available at this call
+                // site (Execution/Order expose price and quantity, not a
+                // realized-P&L-with-commission figure) without reaching for
+                // SystemPerformance.AllTrades after the fact, and because it
+                // essentially never disagrees with net P&L here: the stop is
+                // 80 points (320 ticks) and the targets 40-50 points, both
+                // enormous next to any plausible per-side commission on NQ, so
+                // gross and net classification differ only in a razor-thin
+                // near-breakeven band this strategy's fixed stop/target
+                // geometry almost never lands in. Matches the team lead's own
+                // safety argument for why the caps are exact filters at all:
+                // the trigger is price-driven, not P&L-driven -- classifying
+                // by price alone stays inside that same spirit.
+                if ((price - _openTrade.Value.EntryPx) * _openTrade.Value.Dir < 0)
+                    _lossesToday++;
+
                 WriteTrade(_openTrade.Value, time.Ticks, price, reason);
                 _openTrade = null;
             }
