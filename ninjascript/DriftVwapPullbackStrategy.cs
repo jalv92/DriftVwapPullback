@@ -269,15 +269,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                                                        // zeroed here too for a fresh run, same as
                                                        // every other per-run field above.
 
-                // Fix round 7 -- loud, once, here (never per bar): a capped
-                // run's trade list is a SUBSET of what the plugin would
-                // produce (entries() never caps), so it is not directly
-                // comparable to a default PropSim dump unless the same
-                // filter is applied there too. LogLevel.Alert (log.md: "also
-                // generates a pop-up notification window") because Warning
-                // sitting in a scrollable Log tab is exactly the kind of
-                // message that gets missed -- this one has to land once, not
-                // be findable if you go looking.
+                // Fix round 7/8 -- once, here (never per bar): a capped run's
+                // trade list is a SUBSET of what the plugin would produce
+                // (entries() never caps), so it is not directly comparable to
+                // a default PropSim dump unless the same filter is applied
+                // there too. LogLevel.Warning, not Alert: this fires on every
+                // run where the caps are set and only confirms a value the
+                // user just typed into the parameter grid -- a routine
+                // acknowledgment, not an unexpected condition. The modal
+                // Alert produces is reserved for the guards that actually
+                // abort the run (the timeframe guard, CheckRth); spending it
+                // on a routine confirmation trains the user to dismiss
+                // dialogs from this strategy without reading them.
                 if (MaxTradesPerDay > 0 || MaxLossesPerDay > 0)
                     Log(Name + ": daily caps ACTIVE this run (MaxTradesPerDay="
                         + MaxTradesPerDay + ", MaxLossesPerDay=" + MaxLossesPerDay
