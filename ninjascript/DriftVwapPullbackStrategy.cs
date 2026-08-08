@@ -13,18 +13,46 @@
 // currently only prints the drift state for manual verification against the
 // plugin.
 //
-// R4 -- THE COINCIDENT-CLOSE TRAP. At 10:45, 11:00, ... a 5-minute bar and a
-// 15-minute bar close at the same instant. Reading Closes[1][0] from the
-// primary (BarsInProgress == 0) branch at that moment is a coin flip: whether
-// NinjaTrader has already run the secondary series' OnBarUpdate for this
-// timestamp decides whether that accessor returns the bar that just closed or
-// the one before it -- and that is not documented anywhere in this project's
-// reference material. This file never does that. Every closed 15m bar is
-// appended to `_reg15` (with its own close timestamp) from the BarsInProgress
-// == 1 branch, the only place NinjaTrader guarantees that specific bar is
-// actually closed; DriftStateAt/LastCompletedIndex then SELECT the state to
-// use by comparing timestamps ("the last 15m bar closing at or before asOf"),
-// which is independent of which branch NinjaTrader happened to run first.
+// R4 -- THE COINCIDENT-CLOSE TRAP, AND WHY THIS FILE DOES NOT DEPEND ON
+// SERIES PROCESSING ORDER AT ALL. At 10:45, 11:00, ... a 5-minute bar and a
+// 15-minute bar close at the same instant. Two designs were tried here:
+//
+//   1. (REJECTED) Read Closes[1][0] from the primary branch. A coin flip on
+//      whether NinjaTrader has dispatched the secondary series' own
+//      OnBarUpdate for that timestamp yet.
+//   2. (REJECTED) Append each closed 15m bar to `_reg15` from the
+//      BarsInProgress == 1 branch itself, then select by timestamp. This
+//      still silently depends on dispatch order: PullbackZoneStrategy.cs's
+//      header (lines ~63-71) documents that NT8 processes the PRIMARY series
+//      first on a shared timestamp, so at the coincident bar `_reg15` would
+//      not yet hold the 15m entry the primary branch needs -- a one-bar lag
+//      at every 15-minute boundary, silent, and the SAME family of bug this
+//      file exists to avoid.
+//
+// What this file actually does: `_reg15` is populated ONLY from the PRIMARY
+// (BarsInProgress == 0) branch, via FoldClosedRegimeBars(), which reads
+// BarsArray[Regime15Idx] by ABSOLUTE INDEX -- not through the secondary
+// series' own OnBarUpdate dispatch or its `Closes[1][0]`-style processing
+// pointer at all. This removes the dependency instead of guessing which way
+// it resolves. Two things make this safe:
+//
+//   - NO LOOKAHEAD: b15.Count spans the WHOLE loaded series, future bars
+//     included (NT8 preloads historical data for every added series ahead of
+//     the primary's own dispatch position). FoldClosedRegimeBars' `if
+//     (b15.GetTime(j) > Time[0]) break;` is the ONLY thing standing between
+//     that and reading a bar that has not closed yet, and it must never be
+//     weakened. Same guard, same reasoning, as
+//     PullbackZoneStrategy.FoldClosedZoneBars.
+//   - NO LAG: because the fold runs unconditionally on every primary-branch
+//     call (not "if the secondary already fired"), the coincident 15m bar at
+//     10:45 is folded in during the SAME OnBarUpdate call that evaluates the
+//     10:45 5-minute bar, regardless of whether NinjaTrader has separately
+//     dispatched BarsInProgress == 1 for it yet or ever will before this
+//     read. This file never reads that series' own event at all.
+//
+// DriftStateAt/LastCompletedIndex still select by comparing timestamps ("the
+// last 15m bar closing at or before asOf") -- that part of the design was
+// correct before and is unchanged; only how `_reg15` gets populated changed.
 //
 // PERCENT VS FRACTION. DriftMinPct is a PERCENT (default 0.10 means "0.10%"),
 // while the rate of change computed below is a FRACTION (close/prevClose - 1,
@@ -61,6 +89,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private readonly List<Reg15> _reg15 = new List<Reg15>();
         private double _cumPv, _cumV;
         private int _barsInSession15;
+        private int _regDone = -1;      // last BarsArray[Regime15Idx] index folded into _reg15
 
         protected override void OnStateChange()
         {
@@ -102,6 +131,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // initializers run once at construction, not per State chain.
                 _reg15.Clear();
                 _cumPv = 0; _cumV = 0; _barsInSession15 = 0;
+                _regDone = -1;
 
                 // Spec 5.2: the timeframe is a property of the RUN, not of the code.
                 if (BarsPeriods[0].BarsPeriodType != BarsPeriodType.Minute
@@ -116,14 +146,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         protected override void OnBarUpdate()
         {
-            if (BarsInProgress == Regime15Idx)
-            {
-                UpdateRegime15();
-                return;                                  // no trading logic here (task 7)
-            }
-
+            // BarsInProgress == Regime15Idx does NOTHING -- deliberately. The
+            // 15m regime is folded from THIS (primary) branch instead; see
+            // the file header and FoldClosedRegimeBars.
             if (BarsInProgress != 0 || CurrentBar < 0)
                 return;
+
+            FoldClosedRegimeBars();
 
             // Diagnostic only (task 6, GUI hand-off step 3): prints the drift
             // state and session VWAP at every 5m close so it can be compared,
@@ -135,33 +164,58 @@ namespace NinjaTrader.NinjaScript.Strategies
                 + " vwap15=" + SessionVwap15(0).ToString("F2"));
         }
 
-        // R1 -- session VWAP over 15-minute bars, bar-typical formulation,
-        // reset at the first 15m bar of the RTH session.
-        private void UpdateRegime15()
+        // Folds every 15m bar that has closed at or before the current 5m
+        // bar's close, exactly once, in order -- by ABSOLUTE INDEX into
+        // BarsArray[Regime15Idx], never via that series' own OnBarUpdate
+        // event. See the file header for why this removes the series-
+        // processing-order dependency entirely instead of merely guessing it.
+        //
+        // b15.Count spans the WHOLE loaded series, future bars included --
+        // the `> Time[0]` break is the ONLY thing standing between this loop
+        // and lookahead. IT MUST NEVER BE WEAKENED. Same guard, same
+        // reasoning, as PullbackZoneStrategy.FoldClosedZoneBars.
+        private void FoldClosedRegimeBars()
         {
-            if (Bars.IsFirstBarOfSession)
+            Bars b15 = BarsArray[Regime15Idx];
+            for (int j = _regDone + 1; j < b15.Count; j++)
+            {
+                if (b15.GetTime(j) > Time[0])
+                    break;                                 // not closed yet
+                FoldRegimeBar(b15, j);
+                _regDone = j;
+            }
+        }
+
+        // R1 -- session VWAP over 15-minute bars, bar-typical formulation,
+        // reset at the first 15m bar of the RTH session. IsFirstBarOfSessionByIndex
+        // reads the session boundary from the index itself -- the same
+        // absolute-index discipline as the fold loop that calls this.
+        private void FoldRegimeBar(Bars b15, int j)
+        {
+            if (b15.IsFirstBarOfSessionByIndex(j))
             {
                 _cumPv = 0; _cumV = 0; _barsInSession15 = 0;
             }
 
-            double typ = (Highs[Regime15Idx][0] + Lows[Regime15Idx][0] + Closes[Regime15Idx][0]) / 3.0;
-            double vol = Volumes[Regime15Idx][0];
+            double typ = (b15.GetHigh(j) + b15.GetLow(j) + b15.GetClose(j)) / 3.0;
+            double vol = b15.GetVolume(j);
             _cumPv += typ * vol;
             _cumV += vol;
 
             _reg15.Add(new Reg15
             {
-                CloseTime = Times[Regime15Idx][0],        // NT8 stamps a bar at its CLOSE
-                Close = Closes[Regime15Idx][0],
+                CloseTime = b15.GetTime(j),               // NT8 stamps a bar at its CLOSE
+                Close = b15.GetClose(j),
                 Vwap = _cumPv / Math.Max(_cumV, 1.0),
                 NInSession = _barsInSession15++
             });
         }
 
         // R4's ordering rule: the last 15m bar that CLOSED at or before `asOf`.
-        // Selecting by timestamp rather than by "the most recent BarsInProgress
-        // == 1 call" is what makes this independent of series processing order
-        // -- see the file header.
+        // Selecting by timestamp (rather than by "the last _reg15 entry") is
+        // what makes DriftStateAt itself order-agnostic; FoldClosedRegimeBars
+        // above is what makes the POPULATION of _reg15 order-agnostic too --
+        // see the file header, both matter.
         private int LastCompletedIndex(DateTime asOf)
         {
             for (int i = _reg15.Count - 1; i >= 0; i--)
