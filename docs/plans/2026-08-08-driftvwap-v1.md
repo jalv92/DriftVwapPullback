@@ -433,9 +433,16 @@ def _selfcheck_arming_rearms_after_a_break():
 
 
 def _selfcheck_stop_and_target_sides():
-    bars = _fake_bars(sessions=1, drift_pts_per_bar=4.0)
+    # `pullback_every` and the non-empty assertion are BOTH load-bearing. Without
+    # the first there is no red candle, the long trigger never fires, `idx` comes
+    # back empty, and the loop below asserts nothing while reporting success —
+    # a stop placed on the WRONG SIDE of its entry sails straight through. That
+    # is the bug PropSim's own plugins.py calls "free money that does not exist".
+    # No loop in this file may be reachable with an empty array.
+    bars = _fake_bars(sessions=1, drift_pts_per_bar=4.0, pullback_every=5)
     s = DriftVwapPullback()
-    idx, direc, stop, target = s.entries(bars, tp_ = _fake_tape(bars), p=_defaults())
+    idx, direc, stop, target = s.entries(bars, _fake_tape(bars), _defaults())
+    assert len(idx) > 0, "fixture produced no entries; this check would be vacuous"
     for i in range(len(idx)):
         fill = _fake_tape(bars)["px"][idx[i]]
         if direc[i] > 0:
@@ -448,10 +455,28 @@ def _selfcheck_stop_and_target_sides():
             assert abs(fill - target[i] - 50.0) < 1e-9
 
 
+def _selfcheck_short_side():
+    # Every other fixture rises, so armed_dir == -1, the short stop/target math
+    # and target_points_short are exercised by NOTHING without this. A sign error
+    # confined to the short branch would otherwise pass the whole suite.
+    bars = _fake_bars(sessions=1, drift_pts_per_bar=-4.0, pullback_every=5)
+    s = DriftVwapPullback()
+    idx, direc, stop, target = s.entries(bars, _fake_tape(bars), _defaults())
+    assert len(idx) > 0, "fixture produced no entries; this check would be vacuous"
+    tape = _fake_tape(bars)
+    for i in range(len(idx)):
+        fill = tape["px"][idx[i]]
+        assert direc[i] == -1, "a falling session must go short"
+        assert target[i] < fill < stop[i], "short: stop above, target below"
+        assert abs(stop[i] - fill - 80.0) < 1e-9
+        assert abs(fill - target[i] - 50.0) < 1e-9
+
+
 def _selfcheck_time_window():
-    bars = _fake_bars(sessions=1, drift_pts_per_bar=4.0)
+    bars = _fake_bars(sessions=1, drift_pts_per_bar=4.0, pullback_every=5)
     s = DriftVwapPullback()
     idx, direc, _, _ = s.entries(bars, _fake_tape(bars), _defaults())
+    assert len(idx) > 0, "fixture produced no entries; this check would be vacuous"
     for i in idx:
         sod = tp.sec_of_day(bars["t"][i])
         assert 10 * 3600 + 30 * 60 <= sod <= 15 * 3600 + 30 * 60, (
