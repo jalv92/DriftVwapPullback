@@ -114,6 +114,30 @@ Exits are a fixed stop against a fixed target, plus a flatten before the close. 
 The premise is that VWAP is not a mean-reversion magnet but a place where institutional execution
 imbalance becomes visible — so the trade is continuation, not reversion.
 
+### Trade management
+
+Three controls exist in NinjaTrader only. The PropSim plugin implements none of them, so each is
+**off at its default** and a default run stays comparable to a default plugin dump. Turn any of
+them on and the strategy says so in the log at startup.
+
+| Control | Default | What it does |
+|---|---|---|
+| Draggable stop and target | always on | The bracket is a pair of live-until-cancelled exit orders, priced off the actual fill and never re-asserted. Drag either one in Chart Trader and it **stays** where you put it — the strategy adopts the new price instead of fighting it. |
+| Breakeven | off, at 75 % | Once price covers 75 % of the entry→target run, the stop moves to entry ± an offset, once. It measures against the *live* target, so dragging the target further out moves the trigger with it. |
+| Daily profit / loss limit | off (0 / 0) | Dollar limits on the day. On a breach the strategy flattens and takes no further entries until the next session. |
+
+The daily limits watch the **whole account** by default: every robot trading that account counts
+toward them, whether or not this strategy took the trade. They measure from the 09:30 RTH open, so
+P&L another strategy booked overnight does not count. Switch the checkbox off to measure this
+strategy's own P&L alone. A Strategy Analyzer run always falls back to own-P&L — a backtest has no
+meaningful account-wide figure to read, and the fallback also stops a live chart's breach from
+truncating a mirror-gate run.
+
+Why the bracket had to change shape: NinjaTrader re-asserts the prices of `SetStopLoss` and
+`SetProfitTarget` orders, which is exactly what used to snap a hand-dragged stop back — and while
+one of those is active, the managed approach **ignores** `Exit*` orders outright. The two
+mechanisms cannot coexist, so the `Set*` pair was removed rather than supplemented.
+
 <img src="docs/assets/playback-brackets.png" width="100%" alt="The strategy live in NinjaTrader Playback on MNQ: an open short position with its stop and target bracket lines drawn on the chart, and the account panel showing realised and unrealised P&L">
 
 ## The mirror gate
