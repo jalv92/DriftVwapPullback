@@ -59,6 +59,18 @@
 // order, and the ignore-rules above explicitly do not apply to those ("These
 // rules do not apply to market orders, such as ExitLong() or ExitShort()").
 //
+// v2.1 (2026-08-10) -- A REJECTED ORDER NO LONGER KILLS THE STRATEGY. Paid
+// for in production: at 11:59:58 a DVP_L "Buy 5 Market" on MNQ 09-26 came
+// back Rejected with "Not enough excess margin" (the Sim101 account had been
+// left with $110 of simulated cash), and the default RealtimeErrorHandling
+// .StopCancelClose cancelled every order, closed the position and disabled
+// the strategy for the rest of the day. A rejection is a fact about the
+// ACCOUNT at one instant; on a funded account that same default turns any
+// transient broker refusal into a silent mid-session shutdown. Configure now
+// sets IgnoreAllErrors and this file handles the four rejections itself --
+// see the comment there for the split. Real-time only: a historical run
+// cannot produce a rejection, so the mirror gate is untouched.
+//
 // R4 -- THE COINCIDENT-CLOSE TRAP, AND WHY THIS FILE DOES NOT DEPEND ON
 // SERIES PROCESSING ORDER AT ALL. At 10:45, 11:00, ... a 5-minute bar and a
 // 15-minute bar close at the same instant. Two designs were tried here:
@@ -229,6 +241,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Order _stopOrder, _targetOrder;
         private DateTime _stopCancelAt = DateTime.MinValue, _targetCancelAt = DateTime.MinValue;
 
+        // v2.1 -- set when the STOP comes back Rejected: the position is naked
+        // and, with RealtimeErrorHandling.IgnoreAllErrors in force, nothing in
+        // NinjaTrader is going to close it. The tick branch flattens and keeps
+        // retrying until the flat bookkeeping in OnExecutionUpdate clears this.
+        private bool _bracketFailed;
+
         // In-flight order flags, set BEFORE the Enter*/Exit* call that creates
         // the order -- the workspace's standing rule from the NT8 order-event
         // race (a fill event can arrive inside the submitting call's own stack).
@@ -332,6 +350,27 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Configure)
             {
+                // v2.1 -- survive a rejected order instead of dying on it (see
+                // the file header for the incident this comes from).
+                // realtimeerrorhandling.md is blunt about the price: with
+                // IgnoreAllErrors "nothing auto-closes anymore", so the four
+                // rejections that can reach this strategy are handled by hand,
+                // each where it already has state to clean up:
+                //   ENTRY   -> OnOrderUpdate releases _entryPending and gives
+                //              the day's trade count back (it is taken at
+                //              SUBMIT, and a rejected entry is not a trade).
+                //   STOP    -> the position is NAKED: flatten, retrying every
+                //              tick until it is confirmed gone (_bracketFailed).
+                //   TARGET  -> the stop still protects the trade, so this only
+                //              logs and parks the breakeven; forcing an exit
+                //              over a missing take-profit would be worse.
+                //   FLATTEN -> already released and retried (OnOrderUpdate +
+                //              CheckRiskGovernor), unchanged.
+                // This property is real-time only and must be set here or in
+                // SetDefaults (same doc), so no historical run and no Strategy
+                // Analyzer mirror-gate run can see any of it.
+                RealtimeErrorHandling = RealtimeErrorHandling.IgnoreAllErrors;
+
                 AddDataSeries(BarsPeriodType.Minute, 15);   // BarsInProgress == Regime15Idx (1)
 
                 // Fix round 5: the 1-tick fill-resolution series, ADDED AFTER
@@ -387,6 +426,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _stopOrder = null; _targetOrder = null;
                 _stopCancelAt = DateTime.MinValue; _targetCancelAt = DateTime.MinValue;
                 _entryPending = false; _flattenPending = false;
+                _bracketFailed = false;
                 _dailyLockout = false;
                 _acctSessionDay = DateTime.MinValue;
                 _dayStartRealized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
@@ -494,6 +534,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 CheckRiskGovernor();
                 if (Position.MarketPosition != MarketPosition.Flat)
                 {
+                    // v2.1 -- a rejected stop left this position naked. Nothing
+                    // below can help a position with no protective order
+                    // working, and one Exit call is not guaranteed to fill, so
+                    // this retries every tick exactly like the lockout branch
+                    // of CheckRiskGovernor does. FlattenNow() no-ops while one
+                    // is already working.
+                    if (_bracketFailed)
+                    {
+                        FlattenNow();
+                        return;
+                    }
                     CheckBracketCancels(Times[FillTickIdx][0]);
                     ManagePosition(Closes[FillTickIdx][0]);
                 }
@@ -953,6 +1004,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _stopOrder = null; _targetOrder = null;
                 _stopCancelAt = DateTime.MinValue; _targetCancelAt = DateTime.MinValue;
                 _flattenPending = false;
+                _bracketFailed = false;   // v2.1 -- the naked position is gone
             }
 
             if (_openTrade != null && Position.MarketPosition == MarketPosition.Flat)
@@ -1018,6 +1070,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             int qty = entry.Filled;
             if (qty <= 0)
                 return;
+
+            // v2.1 -- a fresh bracket makes any earlier naked state moot. This
+            // is not redundant with the flat bookkeeping in OnExecutionUpdate:
+            // a rejection that lands AFTER the position already closed by other
+            // means arrives too late for that block to run again, and a
+            // _bracketFailed left standing would flatten the NEXT trade on its
+            // first tick. Set before the submits below, so a rejection arriving
+            // inside their own call stack still wins.
+            _bracketFailed = false;
 
             // Direction from the ORDER's own name, not from _armedDir: the
             // 15m state machine can re-arm the other way while this trade is
@@ -1285,6 +1346,43 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (order.Name == SigStop || order.Name == SigTarget)
             {
+                // v2.1 -- a REJECTED protective order, judged on the NAME and
+                // deliberately AHEAD of the reference check below. Two reasons
+                // it cannot sit behind that gate: a rejection can arrive inside
+                // the submitting call's own stack, before _stopOrder/
+                // _targetOrder have been assigned (realtimeerrorhandling.md's
+                // own example assigns Order objects in this method for exactly
+                // that reason), and the echoes the gate exists to filter are
+                // Cancelled events from our own cancel-replaces -- never
+                // Rejected ones. Missing this event is not a cosmetic loss:
+                // with IgnoreAllErrors it is the only notice that the position
+                // has no stop.
+                if (orderState == OrderState.Rejected)
+                {
+                    if (order.Name == SigStop)
+                    {
+                        _stopPx = 0;
+                        _stopOrder = null;
+                        _bracketFailed = true;
+                        Print(Name + ": " + SigStop + " REJECTED (" + comment
+                            + ") -- position unprotected, flattening.");
+                        FlattenNow();
+                    }
+                    else
+                    {
+                        // The stop still stands, so this is not an emergency:
+                        // forcing an exit over a missing take-profit would turn
+                        // a cosmetic failure into a real one. Zeroing _targetPx
+                        // also parks the breakeven, which has no entry->target
+                        // run left to measure.
+                        _targetPx = 0;
+                        _targetOrder = null;
+                        Print(Name + ": " + SigTarget + " REJECTED (" + comment
+                            + ") -- no take profit working; the stop still protects the trade.");
+                    }
+                    return;
+                }
+
                 // Events for orders that are not the CURRENT references are
                 // echoes of our own cancel-replaces (breakeven, partial-fill
                 // resize) -- ignored wholesale. Names cannot distinguish them;
@@ -1323,7 +1421,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             _entryPending = false;
             if (filled == 0)
-                Print(Name + ": entry " + order.Name + " " + orderState + " unfilled.");
+            {
+                // v2.1 -- hand the day's count back. _tradesToday is taken at
+                // SUBMIT (OnBarUpdate), which was harmless while a rejection
+                // killed the strategy outright; now that the run survives one,
+                // a string of rejections would burn MaxTradesPerDay without a
+                // single trade having happened -- five of them is exactly what
+                // 2026-08-10 would have produced. A partially filled entry
+                // (filled > 0) IS a trade and keeps its count.
+                if (_tradesToday > 0)
+                    _tradesToday--;
+                Print(Name + ": entry " + order.Name + " " + orderState + " unfilled ("
+                    + comment + ") -- not counted against MaxTradesPerDay.");
+            }
         }
 
         private static string Px(double v)
