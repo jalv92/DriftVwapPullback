@@ -257,22 +257,34 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool _dailyLockout;
         private DateTime _acctSessionDay = DateTime.MinValue;
 
-        // Account-wide mode. The dollars that decide a breach come from
-        // Account.Get(...), which is the WHOLE account -- every other robot's
-        // realized and unrealized P&L included. That is the part Javier asked
-        // for and it needs no cooperation from those robots. This static
-        // registry is only how MULTIPLE INSTANCES OF THIS CLASS agree on one
-        // day baseline and propagate a breach to each other; re-read under
-        // lock on every tick, never cached, so a wipe-and-recreate cannot
-        // split the group.
+        // Account-wide mode. The static registry holds one entry per account:
+        // the trading day, the per-instance day-PnL contributions, and the
+        // breach broadcast; re-read under lock on every tick, never cached,
+        // so a wipe-and-recreate cannot split the group.
+        //
+        // SEMANTIC CHANGE 2026-08-10 (LatigoBreak governor bug, fixed in all
+        // three ports): this used to read Account.Get(Realized)+Get(Unrealized)
+        // -- the WHOLE account, every robot's P&L. Those are two separately-
+        // updated aggregates: the instant a winner's closing fill lands,
+        // realized is already credited while account unrealized still carries
+        // the closed position, so the sum double-counts that trade and fires
+        // the daily profit target early (measured live: a $750 target
+        // flattened at $539 realized). Now each instance publishes its OWN
+        // event-ordered P&L and the governor sums the contributions, which is
+        // consistent by construction but only covers INSTANCES OF THIS CLASS.
+        // If cross-robot coverage is ever needed again, the upgrade path is a
+        // single-item read (NetLiquidation minus a day baseline) or a registry
+        // class shared across the strategy files -- all Custom .cs compile
+        // into one assembly.
         private sealed class AcctDayGov
         {
             public DateTime Day;
-            public double Baseline;
             public volatile bool Breached;
+            public readonly Dictionary<string, double> PnL = new Dictionary<string, double>();
         }
         private static readonly object _acctGovLock = new object();
         private static readonly Dictionary<string, AcctDayGov> _acctGov = new Dictionary<string, AcctDayGov>();
+        private string _govKey;   // per-instance registry key, set at DataLoaded (needs Instrument)
 
         private static readonly object _jsonlLock = new object();
         private string _jsonlPath;
@@ -430,6 +442,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _dailyLockout = false;
                 _acctSessionDay = DateTime.MinValue;
                 _dayStartRealized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+                // Per-instance registry key: instrument name for the breach
+                // log's readability + a random suffix so two instances on the
+                // SAME instrument/account never overwrite each other.
+                _govKey = Instrument.FullName + "/" + Guid.NewGuid().ToString("N").Substring(0, 4);
 
                 // A Playback rewind replays a day this account has already
                 // "lived", so any breach the discarded pass broadcast is stale.
@@ -510,9 +526,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // parameter grid means two different things in the Analyzer and
                 // on a live/Playback chart.
                 if ((DailyProfitTargetUSD > 0 || DailyLossLimitUSD > 0) && UseAccountDailyPnL)
-                    Print(Name + ": daily limits watching the WHOLE ACCOUNT ("
+                    Print(Name + ": daily limits shared across every " + Name + " instance on "
                         + (Account != null ? Account.Name : "?")
-                        + ") -- every robot's P&L on it counts toward the "
+                        + " -- their summed P&L counts toward the "
                         + DailyProfitTargetUSD + " / -" + DailyLossLimitUSD + " USD limits.");
             }
         }
@@ -1192,24 +1208,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         // mode cannot operate, and the caller falls back to this instance's own
         // P&L.
         //
-        // WHAT WINDOW THE BASELINE DEFINES, STATED EXACTLY. Baseline is taken
-        // at the first 5-minute close of the RTH session (09:35 ET), so the
-        // governor measures the account's P&L FROM THE RTH OPEN ONWARD -- every
-        // robot's trades, every instrument, but only from 09:30. P&L another
-        // strategy booked in the overnight session (a LatigoBreak 18:00/20:00
-        // window, say) is NOT counted against these limits.
-        //
-        // This is deliberate, not an oversight. Reading the account's own daily
-        // figure raw would capture the overnight too, but it depends on the
-        // broker resetting AccountItem.RealizedProfitLoss at their daily
-        // rollover -- unverified here, and wrong in the expensive direction if
-        // the connection reports a lifetime figure instead (an instant, silent
-        // lockout on the first tick). Subtracting a baseline this file took
-        // itself is correct on every connection, including Playback and Sim101.
-        // Anchoring to the broker's own start-of-day (AccountItem
-        // .SodLiquidatingValue vs NetLiquidation) is the upgrade path if the
-        // overnight ever needs to count; it needs a connection that actually
-        // populates SodLiquidatingValue, which sim accounts often do not.
+        // WHAT WINDOW THE SUM COVERS. Each instance contributes its own P&L
+        // measured from its own _dayStartRealized (reset at the RTH session
+        // open), so the governor covers every instance of THIS strategy from
+        // 09:30 onward. Other robots and the overnight never enter the sum --
+        // see the SEMANTIC CHANGE note on AcctDayGov.
         //
         // HISTORICAL RUNS NEVER PARTICIPATE. A Strategy Analyzer run has no
         // meaningful account-wide P&L to read, and this registry is static --
@@ -1231,12 +1234,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return null;
                 if (g == null || g.Day < _acctSessionDay)
                 {
-                    g = new AcctDayGov
-                    {
-                        Day = _acctSessionDay,
-                        Baseline = Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar),
-                        Breached = false,
-                    };
+                    g = new AcctDayGov { Day = _acctSessionDay, Breached = false };
                     _acctGov[Account.Name] = g;
                 }
                 return g;
@@ -1260,29 +1258,27 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Lockout("account-wide breach broadcast received");
                 return;
             }
-            if (DailyProfitTargetUSD <= 0 && DailyLossLimitUSD <= 0)
-                return;
-
             double dayPnL;
             bool sharedMode = gov != null;
+            string detail = null;
             if (sharedMode)
             {
-                // THE WHOLE ACCOUNT, which is the point: these two figures
-                // include every position and every closed trade on the account
-                // today, whoever put them there -- another strategy, another
-                // instrument, or a manual trade.
-                double realized = Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar) - gov.Baseline;
-                double unrealized = Account.Get(AccountItem.UnrealizedProfitLoss, Currency.UsDollar);
-                dayPnL = realized + unrealized;
+                // Publish own PnL BEFORE the limits-off return: an instance
+                // with its own limits disabled must still count toward the
+                // others' shared sum.
+                double own = OwnDayPnL();
+                lock (_acctGovLock)
+                {
+                    gov.PnL[_govKey] = own;
+                    dayPnL = 0;
+                    foreach (double v in gov.PnL.Values)
+                        dayPnL += v;
+                }
             }
             else
-            {
-                double realized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit - _dayStartRealized;
-                double unrealized = Position.MarketPosition != MarketPosition.Flat
-                    ? Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency)
-                    : 0.0;
-                dayPnL = realized + unrealized;
-            }
+                dayPnL = OwnDayPnL();
+            if (DailyProfitTargetUSD <= 0 && DailyLossLimitUSD <= 0)
+                return;
 
             bool hitTarget = DailyProfitTargetUSD > 0 && dayPnL >= DailyProfitTargetUSD;
             bool hitLoss = DailyLossLimitUSD > 0 && dayPnL <= -DailyLossLimitUSD;
@@ -1290,9 +1286,31 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
 
             if (sharedMode)
+            {
                 gov.Breached = true;   // broadcast to the other instances on this account
-            Lockout(string.Format(CultureInfo.InvariantCulture, "daily {0} hit ({1:F2} USD{2})",
-                hitTarget ? "profit target" : "loss limit", dayPnL, sharedMode ? ", account-wide" : ""));
+                var sb = new System.Text.StringBuilder(" [");
+                lock (_acctGovLock)
+                    foreach (KeyValuePair<string, double> kv in gov.PnL)
+                        sb.Append(kv.Key).Append(' ').Append(kv.Value.ToString("F2", CultureInfo.InvariantCulture)).Append("; ");
+                detail = sb.Append(']').ToString();
+            }
+            Lockout(string.Format(CultureInfo.InvariantCulture, "daily {0} hit ({1:F2} USD{2}{3})",
+                hitTarget ? "profit target" : "loss limit", dayPnL,
+                sharedMode ? ", account-wide" : "", detail ?? ""));
+        }
+
+        // This instance's day PnL from its OWN event-ordered state
+        // (SystemPerformance and Position are both current by the time
+        // OnBarUpdate runs) -- never from the account aggregates, whose
+        // realized/unrealized pair is not a consistent snapshot around a
+        // closing fill (see the SEMANTIC CHANGE note on AcctDayGov).
+        private double OwnDayPnL()
+        {
+            double realized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit - _dayStartRealized;
+            double unrealized = Position.MarketPosition != MarketPosition.Flat
+                ? Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency)
+                : 0.0;
+            return realized + unrealized;
         }
 
         private void Lockout(string reason)
@@ -1543,7 +1561,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double DailyLossLimitUSD { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Limits watch the whole account", Description = "ON (default): the two limits above measure the ACCOUNT's combined P&L since the 09:30 RTH open -- every other robot on the same account counts toward them, whether or not this strategy took the trade. Overnight P&L booked before 09:30 is NOT counted. OFF: only this strategy instance's own P&L. Live/Playback only; a Strategy Analyzer run always falls back to own-P&L.", GroupName = "06. Daily limits", Order = 2)]
+        [Display(Name = "Limits shared across instances", Description = "ON (default): the two limits above measure the summed P&L of EVERY instance of this strategy on the account since the 09:30 RTH open -- all flatten together on a breach. Other robots and manual trades do NOT count. OFF: only this strategy instance's own P&L. Live/Playback only; a Strategy Analyzer run always falls back to own-P&L.", GroupName = "06. Daily limits", Order = 2)]
         public bool UseAccountDailyPnL { get; set; }
 
         // The one C#-only parameter (task 7 brief item 5) -- chart furniture
